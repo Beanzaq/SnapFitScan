@@ -10,6 +10,8 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="SnapFitScan">
 <script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@2.1.0/dist/mobilenet.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
@@ -50,6 +52,48 @@
     body {
       max-width: 100%;
       min-height: 100dvh;
+    }
+    #protGrams, #fatGrams, #carbGrams {
+      font-size: 10px !important;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 70px;
+      display: block;
+      text-align: center;
+    }
+    .result-card .grid.grid-cols-4 {
+      gap: 4px !important;
+    }
+    .macro-pill {
+      min-height: 64px;
+      height: auto;
+      max-width: 100%;
+    }
+    .macro-pill {
+      padding: 4px 2px !important;
+      gap: 2px !important;
+    }
+    .macro-pill .mini-bar {
+      display: none;
+    }
+    .macro-pill .macro-label {
+      font-size: 8px;
+      margin-bottom: 0 !important;
+    }
+    .macro-value {
+      font-size: 9px;
+    }
+    .photo-btn {
+      height: auto !important;
+      min-height: 56px;
+      padding: 12px 16px !important;
+    }
+    .photo-btn-main-text {
+      font-size: 14px !important;
+    }
+    .photo-btn-sub-text {
+      font-size: 10px !important;
     }
   }
   
@@ -810,21 +854,21 @@
       <div class="grid grid-cols-3 gap-2">
         <div class="macro-pill macro-protein flex flex-col items-center justify-center">
           <div id="totalProtein" class="macro-value font-display font-bold" style="color: #3b82f6;">0 г</div>
-          <div class="macro-label mb-1" style="color: rgba(255,255,255, 0.6);">Белки</div>
+          <div class="macro-label mb-1" style="color: rgba(255,255,255, 0.6);">Белки г.</div>
           <div class="mini-bar">
             <div id="proteinBar" class="mini-fill protein-mini" style="width: 0%;"></div>
           </div>
         </div>
         <div class="macro-pill macro-fat flex flex-col items-center justify-center">
           <div id="totalFat" class="macro-value font-display font-bold" style="color: #f97316;">0 г</div>
-          <div class="macro-label mb-1" style="color: rgba(255,255,255, 0.6);">Жиры</div>
+          <div class="macro-label mb-1" style="color: rgba(255,255,255, 0.6);">Жиры г.</div>
           <div class="mini-bar">
             <div id="fatBar" class="mini-fill fat-mini" style="width: 0%;"></div>
           </div>
         </div>
         <div class="macro-pill macro-carb flex flex-col items-center justify-center">
           <div id="totalCarbs" class="macro-value font-display font-bold" style="color: #a855f7;">0 г</div>
-          <div class="macro-label mb-1" style="color: rgba(255,255,255, 0.6);">Углев.</div>
+          <div class="macro-label mb-1" style="color: rgba(255,255,255, 0.6);">Углев. г.</div>
           <div class="mini-bar">
             <div id="carbsBar" class="mini-fill carb-mini" style="width: 0%;"></div>
           </div>
@@ -1691,6 +1735,34 @@ document.addEventListener('DOMContentLoaded', () => {
   renderRecommendations();
   renderAchievements();
 
+  // Load meal.json and merge with LOCAL_FOOD_DB
+  fetch('meal.json')
+    .then(res => res.json())
+    .then(mealData => {
+      console.log('Loaded meal.json with', mealData.length, 'items');
+      mealData.forEach(item => {
+        // Capitalize first letter for Russian text
+        const capitalize = (str) => str.charAt(0).toUpperCase() + str.slice(1);
+        // Convert from meal.json format to LOCAL_FOOD_DB format
+        const foodEntry = {
+          name: capitalize(item.name) + (item.preparation ? ' ' + capitalize(item.preparation) : ''),
+          cal: item.calories,
+          prot: item.protein,
+          fat: item.fat,
+          carbs: item.carbs
+        };
+        // Avoid duplicates - only add if not already exists
+        const exists = LOCAL_FOOD_DB.some(
+          existing => existing.name.toLowerCase() === foodEntry.name.toLowerCase()
+        );
+        if (!exists) {
+          LOCAL_FOOD_DB.push(foodEntry);
+        }
+      });
+      console.log('LOCAL_FOOD_DB now has', LOCAL_FOOD_DB.length, 'items');
+    })
+    .catch(err => console.log('meal.json not found or error:', err));
+
   // Photo inputs
   ['photoInput','photoInput2'].forEach(id => {
     const el = document.getElementById(id);
@@ -1781,7 +1853,194 @@ function handleFileSelect(e, context) {
 }
 
 // OpenRouter API Key
-const OPENROUTER_API_KEY = '';
+const OPENROUTER_API_KEY = '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';
+
+// ============ TENSORFLOW.JS FOOD CLASSIFIER ============
+let tfjsModel = null;
+let tfjsModelLoading = false;
+
+// Food-101 to Russian food mapping
+const FOOD_CATEGORY_MAP = {
+  'pizza': ['пицца', 'маргарита', 'пеперони'],
+  'hamburger': ['бургер', 'гамбургер', 'котлета'],
+  'hot_dog': ['хот-дог', 'сосиска'],
+  'french_fries': ['картофель фри', 'фри', 'чипсы'],
+  'steak': ['стейк', 'говядина', 'бифштекс'],
+  'chicken_wings': ['крылышки', 'куриные крылышки', 'курица'],
+  'sushi': ['суши', 'роллы', 'северные роллы'],
+  'ramen': ['рамэн', 'лапша', 'японская лапша'],
+  'spaghetti_bolognese': ['спагетти', 'макароны', 'паста'],
+  'spaghetti_carbonara': ['спагетти карбонара', 'паста карбонара'],
+  'lasagna': ['лазанья', 'лазания'],
+  'risotto': ['ризотто'],
+  'gyoza': ['пельмени', 'манты', 'димсам'],
+  'dumplings': ['пельмени', 'манты', 'вареники', 'димсам'],
+  'spring_rolls': ['роллы', 'суши', 'голубцы'],
+  'falafel': ['фалафель', 'котлеты из нута'],
+  'beef_carpaccio': ['карпачо', 'мясо сырое'],
+  'beef_tartare': ['тартар', 'фарш'],
+  'tuna_tartare': ['тунец', 'рыба'],
+  'ceviche': ['ceviche', 'рыба маринованная'],
+  'shrimp_and_grits': ['креветки', 'морепродукты'],
+  'lobster_roll_sandwich': ['ролл с лобстером', 'морской котлет'],
+  'clam_chowder': ['суп из моллюсков', 'clam chowder'],
+  'lobster_bisque': ['лобстер биск', 'суп из омаров'],
+  'filet_mignon': ['филе миньон', 'вырезка'],
+  'prime_rib': ['ростбиф', 'говядина'],
+  'pulled_pork_sandwich': ['свинной бутерброд', 'бутерброд'],
+  'club_sandwich': ['клубный сэндвич', 'сэндвич'],
+  'grilled_cheese_sandwich': ['сырный тост', 'гренки с сыром'],
+  'croque_madame': ['крок мадам', 'бутерброд'],
+  'eggs_benedict': ['яйца бенедикт', 'яйца'],
+  'omelette': ['омлет', 'яичница'],
+  'huevos_ranchereros': ['яйца по-рейнджерски', 'яйца'],
+  'breakfast_burrito': ['буррито на завтрак', 'буррито'],
+  'caesar_salad': ['цезарь', 'салат цезарь'],
+  'greek_salad': ['греческий салат', 'салат'],
+  'caprese_salad': ['капрезе', 'томаты моцарелла'],
+  'beet_salad': ['свекольный салат', 'салат из свеклы'],
+  'seaweed_salad': ['водорослевый салат', 'салат'],
+  'guacamole': ['гуакамоле', 'авокадо'],
+  'hummus': ['хумус', 'нут'],
+  'deviled_eggs': ['фаршированные яйца', 'яйца'],
+  'edamame': ['эдамаме', 'соевые бобы'],
+  'ice_cream': ['мороженое'],
+  'frozen_yogurt': ['замороженный йогурт', 'йогурт'],
+  'donuts': ['пончики', 'donut'],
+  'cup_cakes': ['кексы', 'маффины'],
+  'cheesecake': ['чизкейк', 'сырный пирог'],
+  'carrot_cake': ['морковный торт', 'торт'],
+  'red_velvet_cake': ['ред велвет торт', 'торт'],
+  'chocolate_cake': ['шоколадный торт', 'торт'],
+  'chocolate_mousse': ['шоколадный мусс', 'мусс'],
+  'panna_cotta': ['панна кота', 'крем'],
+  'tiramisu': ['тирамису'],
+  'baklava': ['баклава', 'пахлава'],
+  'creme_brulee': ['крем брюле', 'десерт'],
+  'churros': ['чуррос', 'пончики'],
+  'macarons': ['макарон', 'макарун'],
+  'cannoli': ['канноли', 'пирожок'],
+  'beignets': ['беинье', 'пончики'],
+  'waffles': ['вафли'],
+  'pancakes': ['блины', 'оладьи'],
+  'bread_pudding': ['пудинг из хлеба', 'пудинг'],
+  'french_toast': ['французский тост', 'тост'],
+  'mussels': ['мидии', 'моллюски'],
+  'oysters': ['устрицы'],
+  'crab_cakes': ['крабовые котлеты', 'крабы'],
+  'fried_calamari': ['кальмары', 'жареные кальмары'],
+  'fish_and_chips': ['рыба и чипсы', 'рыба'],
+  'grilled_salmon': ['лосось', 'семга'],
+  'sashimi': ['сашими', 'рыба'],
+  'pad_thai': ['паттай', 'тайская лапша'],
+  'fried_rice': ['жареный рис', 'рис'],
+  'pho': ['фо', 'вьетнамский суп'],
+  'paella': ['паэлья', 'рис'],
+  'bibimbap': ['бибимбап', 'корейский рис'],
+  'chicken_curry': ['карри', 'курица карри'],
+  'chicken_quesadilla': ['куриная кесадилья', 'кесадилья'],
+  'foie_gras': ['фуа-гра', 'гусиная печень'],
+  'french_onion_soup': ['французский луковый суп', 'луковый суп'],
+  'escargots': ['улитки', 'эскарго'],
+  'gnocchi': ['ньокки', 'клецки'],
+  'ravioli': ['равиоли', 'пельмени'],
+  'macaroni_and_cheese': ['макароны с сыром', 'сырные макароны'],
+  'garlic_bread': ['чесночный хлеб', 'гренки'],
+  'onion_rings': ['луковые кольца', 'лук'],
+  'nachos': ['nachos', 'тортилья'],
+  'miso_soup': ['мисо суп', 'суп'],
+  'hot_and_sour_soup': ['кисло-острый суп', 'суп'],
+  'samosa': ['самоса', 'пирожок'],
+  'scallops': ['гребешки', 'морские гребешки'],
+  'tacos': ['тако', 'лепешки'],
+  'takoyaki': ['такояки', 'осьминог'],
+  'poutine': ['путен', 'картофель'],
+  'pork_chop': ['свиная отбивная', 'свинина'],
+  'peking_duck': ['утка по-пекински', 'утка']
+};
+
+// Load TensorFlow.js model
+async function loadTfjsModel() {
+  if (tfjsModel) return tfjsModel;
+  if (tfjsModelLoading) return null;
+
+  tfjsModelLoading = true;
+  console.log('Loading TensorFlow.js MobileNet model...');
+
+  try {
+    tfjsModel = await mobilenet.load({
+      version: 2,
+      alpha: 1.0
+    });
+    console.log('TensorFlow.js model loaded successfully');
+    tfjsModelLoading = false;
+    return tfjsModel;
+  } catch (error) {
+    console.error('Error loading TF.js model:', error);
+    tfjsModelLoading = false;
+    return null;
+  }
+}
+
+// Classify image using TensorFlow.js
+async function classifyWithTfjs(imageElement) {
+  const model = await loadTfjsModel();
+  if (!model) return null;
+
+  try {
+    const predictions = await model.classify(imageElement);
+    console.log('TF.js predictions:', predictions);
+    return predictions;
+  } catch (error) {
+    console.error('Classification error:', error);
+    return null;
+  }
+}
+
+// Find food in local DB based on TF.js prediction
+function findFoodByCategory(predictions) {
+  if (!predictions || predictions.length === 0) return null;
+
+  // Capitalize first letter for Russian text
+  const capitalize = (str) => str.charAt(0).toUpperCase() + str.slice(1);
+
+  for (const pred of predictions) {
+    const className = pred.className.toLowerCase().replace(/_/g, ' ');
+    console.log('Checking category:', className);
+
+    // Direct match
+    if (FOOD_CATEGORY_MAP[className]) {
+      const searchTerms = FOOD_CATEGORY_MAP[className];
+
+      for (const term of searchTerms) {
+        const found = LOCAL_FOOD_DB.find(f =>
+          f.name.toLowerCase().includes(term.toLowerCase())
+        );
+        if (found) {
+          console.log('Found match:', found.name);
+          return { ...found, name: capitalize(found.name), confidence: pred.probability };
+        }
+      }
+    }
+
+    // Partial match in category name
+    for (const [category, terms] of Object.entries(FOOD_CATEGORY_MAP)) {
+      if (className.includes(category) || category.includes(className.split(' ')[0])) {
+        for (const term of terms) {
+          const found = LOCAL_FOOD_DB.find(f =>
+            f.name.toLowerCase().includes(term.toLowerCase())
+          );
+          if (found) {
+            console.log('Found partial match:', found.name);
+            return { ...found, name: capitalize(found.name), confidence: pred.probability };
+          }
+        }
+      }
+    }
+  }
+
+  return null;
+}
 
 // ============ LOCAL FOOD DATABASE ============
 const LOCAL_FOOD_DB = [
@@ -2369,6 +2628,69 @@ async function analyzePhoto(context) {
     return;
   }
 
+  // Check if API key is empty - use TensorFlow.js local mode
+  if (!OPENROUTER_API_KEY || OPENROUTER_API_KEY.trim() === '') {
+    console.log('Using TensorFlow.js for local classification...');
+
+    // Try TensorFlow.js classification first
+    try {
+      // Create image element from dataURL
+      const img = new Image();
+      img.src = imageData;
+
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+      });
+
+      const predictions = await classifyWithTfjs(img);
+      console.log('Predictions:', predictions);
+
+      if (predictions && predictions.length > 0) {
+        // Try to find food in our database
+        const matchedFood = findFoodByCategory(predictions);
+
+        if (matchedFood) {
+          console.log('Found food via TF.js:', matchedFood.name);
+          const foodData = {
+            name: matchedFood.name,
+            cal: matchedFood.cal,
+            prot: matchedFood.prot,
+            fat: matchedFood.fat,
+            carbs: matchedFood.carbs
+          };
+          displayResult(context, foodData, imageData);
+          return;
+        }
+      }
+    } catch (tfError) {
+      console.error('TensorFlow.js error:', tfError);
+    }
+
+    // Fallback to manual input if TF.js didn't find match
+    loader.classList.add('hidden');
+    const foodName = prompt('Введите название блюда (например: гречка, куриная грудка, оливье):');
+    if (!foodName || foodName.trim() === '') {
+      showToast('Введите название блюда', 'error');
+      return;
+    }
+
+    const matchedFood = findInLocalDB(foodName);
+    if (matchedFood) {
+      const foodData = {
+        name: matchedFood.name,
+        cal: matchedFood.cal,
+        prot: matchedFood.prot,
+        fat: matchedFood.fat,
+        carbs: matchedFood.carbs
+      };
+      displayResult(context, foodData, imageData);
+    } else {
+      showToast('Блюдо не найдено в базе. Попробуйте другое название.', 'error');
+    }
+    return;
+  }
+
   try {
     // Extract base64 from data URL
     const base64Image = imageData.split(',')[1];
@@ -2453,10 +2775,14 @@ function displayResult(context, food, imageData) {
     return;
   }
 
+  // Capitalize first letter for display
+  const capitalize = (str) => str.charAt(0).toUpperCase() + str.slice(1);
+  const displayName = capitalize(food.name);
+
   if (context === 'today') {
     currentResult = { ...food, img: imageData };
     document.getElementById('resultImg').src = imageData;
-    document.getElementById('dishName').value = food.name;
+    document.getElementById('dishName').value = displayName;
     document.getElementById('rCal').textContent = food.cal;
     document.getElementById('rProt').textContent = food.prot + ' г';
     document.getElementById('rFat').textContent = food.fat + ' г';
@@ -2466,7 +2792,7 @@ function displayResult(context, food, imageData) {
   } else {
     currentResult2 = { ...food, img: imageData };
     document.getElementById('resultImg2').src = imageData;
-    document.getElementById('dishName2').value = food.name;
+    document.getElementById('dishName2').value = displayName;
     document.getElementById('rCal2').textContent = food.cal;
     document.getElementById('rProt2').textContent = food.prot + ' г';
     document.getElementById('rFat2').textContent = food.fat + ' г';
@@ -2475,8 +2801,8 @@ function displayResult(context, food, imageData) {
     document.getElementById('analysisResult2').classList.remove('hidden');
   }
 
-  // Calculate portion weight based on calories (assuming ~200g portion for typical meal)
-  const portionWeight = Math.round(food.cal * 0.4);
+  // Default portion weight is 100g
+  const portionWeight = 100;
   document.getElementById('portionWeightDisplay').textContent = portionWeight;
 
   // Set up portion editor values
@@ -2847,9 +3173,9 @@ function updateTotals() {
   const macros = calculateMacroGoals();
 
   animateCounter('totalCalDisplay', totCal);
-  document.getElementById('totalProtein').textContent = totProt + '/' + macros.protGoal + ' г';
-  document.getElementById('totalFat').textContent = totFat + '/' + macros.fatGoal + ' г';
-  document.getElementById('totalCarbs').textContent = totCarbs + '/' + macros.carbGoal + ' г';
+  document.getElementById('totalProtein').textContent = totProt + '/' + macros.protGoal;
+  document.getElementById('totalFat').textContent = totFat + '/' + macros.fatGoal;
+  document.getElementById('totalCarbs').textContent = totCarbs + '/' + macros.carbGoal;
   document.getElementById('goalDisplay').textContent = goal;
 
   // Add tooltips for macros with daily goals
